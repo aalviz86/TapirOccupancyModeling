@@ -1,0 +1,540 @@
+# Libraries ---------------------------------------------------------------
+library(unmarked)
+library(readxl)  
+library(AICcmodavg)  # For AICc and model selection
+library(ggplot2)  # For data visualization
+library(doParallel)  # For parallel processing
+library(foreach)  # For parallel loop execution
+library(caret)  # For data processing and modeling
+library(dplyr)  # For data manipulation
+library(writexl)  # For exporting data to Excel
+library(ggcorrplot)  # For visualizing correlation matrices
+library(rlang)  # For handling R language objects
+library(tidyr)  # For data tidying
+library(MuMIn)  # For model averaging
+library(RColorBrewer)  # For color palettes
+
+# Read and check data -----------------------------------------------------
+setwd("~/09. Meta Analysis")
+data <- read_xlsx("ori.xlsx")  
+
+# Prepare presence/absence matrix and covariates --------------------------
+y <- as.matrix(data[, 13:27])  # Extract columns with presence/absence data
+
+# Helper function to convert columns to numeric
+convert_to_numeric <- function(column) {
+  as.numeric(as.character(column))
+}
+
+# Process and standardize covariates --------------------------------------
+# Original covariates and converting to numeric
+covariates.orig <- list(
+  dense = convert_to_numeric(data[["forest_d"]]),
+  gallery = convert_to_numeric(data[["forest_g"]]),
+  open = convert_to_numeric(data[["forest_a"]]),
+  sav = convert_to_numeric(data[["savanna"]]),
+  crops = convert_to_numeric(data[["crops"]]),
+  past = convert_to_numeric(data[["pasture"]]),
+  d_streams = convert_to_numeric(data[["d_streams"]]),
+  d_crops = convert_to_numeric(data[["d_crops"]]),
+  d_roads = convert_to_numeric(data[["d_roads"]])
+)
+
+# Remove rows with missing values and standardize
+covariates.df <- as.data.frame(covariates.orig)
+covariates.df <- covariates.df[complete.cases(covariates.df), ]  # Filter out incomplete cases
+
+# Calculate means and standard deviations for standardization
+means <- sapply(covariates.df, mean)
+sds <- sapply(covariates.df, sd)
+
+# Standardize covariates
+covariates <- as.data.frame(lapply(seq_along(covariates.df), function(i) {
+  (covariates.df[[i]] - means[i]) / sds[i]
+}))
+names(covariates) <- names(covariates.df)
+
+# Check for multicollinearity ---------------------------------------------
+# Calculate correlation matrix and plot it
+cor_matrix <- cor(covariates.df, use = "pairwise.complete.obs")
+ggcorrplot(cor_matrix, method = "circle", type = "lower", lab = TRUE, title = "Correlation Matrix of Covariates")
+
+# Unmarked frame setup ----------------------------------------------------
+# Create an unmarked frame for occupancy modeling
+umf <- unmarkedFrameOccu(y = y, siteCovs = covariates)
+summary(umf)
+
+# Parallel Processing Setup -----------------------------------------------
+# Set up parallel processing to speed up model fitting
+cl <- makeCluster(detectCores() - 2)  # Use available cores minus two
+registerDoParallel(cl)
+
+# Model Fitting -----------------------------------------------------------
+# Fit occupancy models in parallel
+cov_names <- names(covariates)
+max_models <- 5000
+model_counter <- 0
+
+# Iterate over covariate combinations for detection and occupancy formulas
+models <- foreach(p_cov_len = seq_along(cov_names), .combine = 'c', .packages = c('unmarked', 'AICcmodavg')) %dopar% {
+  model_list <- list()
+  p_combinations <- combn(cov_names, p_cov_len, simplify = FALSE)
+  
+  for (p_covs in p_combinations) {
+    for (psi_cov_len in seq_along(cov_names)) {
+      psi_combinations <- combn(cov_names, psi_cov_len, simplify = FALSE)
+      
+      for (psi_covs in psi_combinations) {
+        if (model_counter >= max_models) return(model_list)
+        
+        # Construct detection and occupancy formulas
+        p_formula <- paste("~", paste(p_covs, collapse = " + "))
+        psi_formula <- paste("~", paste(psi_covs, collapse = " + "))
+        full_formula <- as.formula(paste(p_formula, psi_formula))
+        
+        # Fit the model and store it in the list
+        model_name <- paste0("p(", paste(p_covs, collapse = "+"), ")psi(", paste(psi_covs, collapse = "+"), ")")
+        model_list[[model_name]] <- tryCatch({
+          occu(full_formula, data = umf)
+        }, error = function(e) NULL)
+        
+        model_counter <- model_counter + 1
+      }
+    }
+  }
+  return(model_list)
+}
+
+# Remove NULL models from the list
+models <- models[!sapply(models, is.null)]
+stopCluster(cl)  # Stop parallel processing
+
+# AIC Model Selection -----------------------------------------------------
+# Calculate AICc values and select the best models
+aic_values <- sapply(models, function(m) tryCatch(AICc(m), error = function(e) NA))
+aic_data <- data.frame(Model = names(aic_values), AICc = aic_values)
+aic_data <- na.omit(aic_data)
+model_list <- models[match(aic_data$Model, names(models))]  # Match models with AIC data
+aic_table <- aictab(cand.set = model_list, modnames = aic_data$Model)
+
+# Extract top models ------------------------------------------------------
+# Identify models within 2 AICc units of the best model
+if ("Model" %in% colnames(aic_data)) {
+  top_models <- aic_data %>%
+    arrange(AICc) %>%
+    filter(AICc - min(AICc) < 2) %>%
+    pull(Model)
+  top_model_list <- model_list[top_models]
+  
+  # Perform model averaging if more than one top model is available
+  if (length(top_model_list) > 1) {
+    avg_psi <- model.avg(top_model_list)
+    print(summary(avg_psi))
+  } else {
+    stop("Not enough models for averaging. Ensure more than one model meets the AIC threshold.")
+  }
+} else {
+  stop("Error: 'Model' column not found in 'aic_data'. Check the structure of the AIC table.")
+}
+
+# Goodness-of-Fit Test ----------------------------------------------------
+# Perform a parametric bootstrap goodness-of-fit test on the top model
+top_model <- top_model_list[[1]]
+
+# Ensure the number of rows in `y` matches the expected range
+n_sites <- nrow(y)  # Number of sites in your response matrix
+full_formula <- ~ dense + crops + past + d_streams ~ dense + gallery + sav + past
+
+# Create k-folds for cross-validation using indices from 1 to n_sites
+set.seed(123)  # For reproducibility
+folds <- createFolds(1:n_sites, k = 5)
+
+# Function to run model on training data and evaluate on testing data
+cv_results <- lapply(folds, function(fold_indices) {
+  # Ensure the fold indices are valid for the dimensions of y and covariates
+  if (max(fold_indices) > n_sites) {
+    stop("Fold indices exceed the number of sites in y.")
+  }
+  
+  # Split the response matrix `y`
+  training_y <- y[-fold_indices, , drop = FALSE]  # Training response matrix
+  testing_y <- y[fold_indices, , drop = FALSE]    # Testing response matrix
+  
+  # Split the site covariates
+  training_covs <- covariates[-fold_indices, , drop = FALSE]  # Training covariates
+  testing_covs <- covariates[fold_indices, , drop = FALSE]    # Testing covariates
+  
+  # Create new unmarkedFrameOccu objects for training and testing
+  training_umf <- unmarkedFrameOccu(y = training_y, siteCovs = training_covs)
+  testing_umf <- unmarkedFrameOccu(y = testing_y, siteCovs = testing_covs)
+  
+  # Fit the model to training data
+  tryCatch({
+    model <- occu(formula = full_formula, data = training_umf)
+    
+    # Predict on testing data and compute a fit statistic (e.g., mean squared error)
+    predictions <- predict(model, type = "state", newdata = testing_umf)
+    mean((testing_y - predictions$Predicted)^2, na.rm = TRUE)  # Mean squared error
+  }, error = function(e) {
+    cat("Model failed on this fold:", e$message, "\n")
+    NA  # Return NA if the model fitting fails
+  })
+})
+
+# Compute the average fit statistic across all folds
+average_fit_statistic <- mean(unlist(cv_results), na.rm = TRUE)
+print(average_fit_statistic)
+
+gof_test <- tryCatch({
+  parboot(top_model, fitstats = function(fm) {
+    # Freeman-Tukey discrepancy for assessing fit
+    observed <- residuals(fm, type = "response")
+    fitted_values <- fitted(fm)
+    sum((sqrt(observed) - sqrt(fitted_values))^2)
+  }, nsim = 100)  # You can increase nsim if successful
+}, error = function(e) {
+  cat("Goodness-of-fit test failed:", e$message, "\n")
+  NULL  # Return NULL if the test fails
+})
+
+# Check if the Freeman-Tukey-based goodness-of-fit test was successful
+if (!is.null(gof_test)) {
+  print(gof_test)
+} else {
+  cat("Consider alternative methods for evaluating model fit, like cross-validation.\n")
+}
+
+# Estimate Overdispersion -------------------------------------------------
+# Calculate the overdispersion parameter (c-hat)
+chisq_obs <- sum(residuals(top_model, type = "pearson")^2)
+df_residual <- length(residuals(top_model)) - length(coef(top_model))
+chat <- chisq_obs / df_residual
+cat("Overdispersion parameter (c-hat):", chat, "\n")
+
+# Naïve Occupancy and Detection -------------------------------------------
+# Calculate naive occupancy and detection probabilities
+detected_sites <- apply(y, 1, function(row) any(row == 1))
+naive_occupancy <- sum(detected_sites) / nrow(y)
+cat("Naïve Occupancy:", naive_occupancy, "\n")
+
+total_detections <- sum(y)
+total_surveys <- length(y)
+naive_detection_probability <- total_detections / total_surveys
+cat("Naïve Detection Probability:", naive_detection_probability, "\n")
+
+# Model Averaging and Predictions -----------------------------------------
+# Predict detection and occupancy probabilities using top models
+detection_predictions <- sapply(top_model_list, function(mod) as.numeric(predict(mod, type = "det", newdata = umf)$Predicted))
+occupancy_predictions <- sapply(top_model_list, function(mod) as.numeric(predict(mod, type = "state", newdata = umf)$Predicted))
+detection_predictions <- as.matrix(detection_predictions)
+occupancy_predictions <- as.matrix(occupancy_predictions)
+
+# Calculate AICc Weights --------------------------------------------------
+aic_table_top <- aictab(cand.set = top_model_list)
+detection_weights <- as.numeric(aic_table_top$AICcWt)
+occupancy_weights <- as.numeric(aic_table_top$AICcWt)
+
+# Calculate Weighted Averages ---------------------------------------------
+# Compute model-averaged probabilities
+if (ncol(detection_predictions) == length(detection_weights) &&
+    ncol(occupancy_predictions) == length(occupancy_weights)) {
+  
+  avg_detection <- rowSums(detection_predictions * detection_weights, na.rm = TRUE)
+  avg_occupancy <- rowSums(occupancy_predictions * occupancy_weights, na.rm = TRUE)
+} else {
+  stop("Mismatch in dimensions of predictions and weights.")
+}
+
+cat("Model-averaged detection probabilities (first 10 values):\n", head(avg_detection, 10), "\n")
+cat("Model-averaged occupancy probabilities (first 10 values):\n", head(avg_occupancy, 10), "\n")
+
+# Extract Model-Averaged Coefficients -------------------------------------
+# Assuming `avg_psi` is the object with model-averaged results for occupancy
+avg_psi <- model.avg(top_model_list)
+
+# Get the full and conditional model-averaged coefficients
+model_avg_results_full <- summary(avg_psi)$coefmat.full
+model_avg_results_cond <- summary(avg_psi)$coefmat.cond
+
+# Convert the results to data frames for easier export
+full_avg <- data.frame(
+  Parameter = rownames(model_avg_results_full),
+  Estimate = model_avg_results_full[, "Estimate"],
+  StdError = model_avg_results_full[, "Std. Error"]
+)
+
+conditional_avg <- data.frame(
+  Parameter = rownames(model_avg_results_cond),
+  Estimate = model_avg_results_cond[, "Estimate"],
+  StdError = model_avg_results_cond[, "Std. Error"]
+)
+
+# Display Model-Averaged Estimates
+cat("Model-Averaged Occupancy Estimates (ψ):\n")
+print(full_avg[grep("psi", full_avg$Parameter), ])
+
+cat("\nModel-Averaged Detection Estimates (p):\n")
+print(full_avg[grep("p", full_avg$Parameter), ])
+
+
+# Save Model-Averaged Coefficients to Excel -------------------------------
+# Export model-averaged coefficients
+write_xlsx(list(Full_Average = full_avg, Conditional_Average = conditional_avg),
+           path = "Model_Averaged_Coefficients.xlsx")
+
+
+# Extracting the occupancy values of the best model -----------------------
+
+# Extract the summary of your top model
+model_summary <- summary(top_model)
+
+# Extract occupancy estimates and standard errors
+occupancy_estimates <- model_summary$state$Estimate
+
+# Define a logistic function to convert logit to probability
+logit_to_prob <- function(logit) {
+  exp(logit) / (1 + exp(logit))
+}
+
+# Apply the logistic function to the occupancy estimates
+occupancy_probabilities <- logit_to_prob(occupancy_estimates)
+occupancy_se <- model_summary$state$SE
+occupancy_names <- names(occupancy_estimates)
+
+# Apply the logistic function to convert estimates
+occupancy_probabilities <- logit_to_prob(occupancy_estimates)
+
+occupancy_names <- rownames(model_summary$state)
+
+# Create a data frame with the occupancy probabilities
+occupancy_results <- data.frame(
+  Parameter = occupancy_names,
+  Logit_Estimate = occupancy_estimates,
+  Probability = occupancy_probabilities,
+  SE = occupancy_se
+)
+
+# Calculate the lower and upper bounds on the logit scale
+logit_lower <- occupancy_estimates - 1.96 * occupancy_se
+logit_upper <- occupancy_estimates + 1.96 * occupancy_se
+
+# Convert the bounds to probabilities
+prob_lower <- logit_to_prob(logit_lower)
+prob_upper <- logit_to_prob(logit_upper)
+
+# Add the confidence intervals to the data frame
+occupancy_results$Lower_CI <- prob_lower
+occupancy_results$Upper_CI <- prob_upper
+
+# Print the results
+print(occupancy_results)
+
+
+# Extracting the detection values of the best model -----------------------
+
+# Extract detection estimates and standard errors
+detection_estimates <- model_summary$det$Estimate
+
+# Apply the logistic function to convert logit estimates to probabilities
+detection_probabilities <- logit_to_prob(detection_estimates)
+detection_se <- model_summary$det$SE
+detection_names <- rownames(model_summary$det)
+
+# Create a data frame with the detection probabilities
+detection_results <- data.frame(
+  Parameter = detection_names,
+  Logit_Estimate = detection_estimates,
+  Probability = detection_probabilities,
+  SE = detection_se
+)
+
+# Calculate the lower and upper bounds on the logit scale for detection
+logit_lower_det <- detection_estimates - 1.96 * detection_se
+logit_upper_det <- detection_estimates + 1.96 * detection_se
+
+# Convert the bounds to probabilities for detection
+prob_lower_det <- logit_to_prob(logit_lower_det)
+prob_upper_det <- logit_to_prob(logit_upper_det)
+
+# Add the confidence intervals to the data frame for detection
+detection_results$Lower_CI <- prob_lower_det
+detection_results$Upper_CI <- prob_upper_det
+
+# Print the detection results
+print(detection_results)
+
+# Plotting Occupancy Probabilities ----------------------------------------
+# Convert logit estimates to probabilities and plot
+logit_to_prob <- function(logit) {
+  exp(logit) / (1 + exp(logit))
+}
+
+model_summary <- summary(top_model)
+occupancy_estimates <- model_summary$state$Estimate
+occupancy_se <- model_summary$state$SE
+occupancy_probabilities <- logit_to_prob(occupancy_estimates)
+logit_lower <- occupancy_estimates - 1.96 * occupancy_se
+logit_upper <- occupancy_estimates + 1.96 * occupancy_se
+prob_lower <- logit_to_prob(logit_lower)
+prob_upper <- logit_to_prob(logit_upper)
+
+# Manually assign names to occupancy_estimates
+names(occupancy_estimates) <- c("(Intercept)", "dense", "crops", "past", "d_streams")
+
+# Now create the data frame
+occupancy_results <- data.frame(
+  Parameter = names(occupancy_estimates),
+  Probability = occupancy_probabilities,
+  Lower_CI = prob_lower,
+  Upper_CI = prob_upper
+)
+
+# Print the results to verify
+print(occupancy_results)
+
+
+# Create a plot for occupancy probabilities with confidence intervals
+ggplot(occupancy_results, aes(x = factor(Parameter), y = Probability)) +
+  geom_point(color = "black", size = 3) +
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), width = 0.2, color = "grey") +
+  labs(
+    x = "Covariates",
+    y = "Occupancy Probability"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 14, hjust = 0.5, vjust = -1.5),
+    axis.title.y = element_text(size = 14, hjust = 0.5, vjust = 1.5),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    panel.border = element_rect(color = "black", fill = NA, size = 1)
+  )
+
+# Sensitivity Analysis ----------------------------------------------------
+# Calculate Probability to Detect at Least One Specimen (P*)
+set.seed(123)
+survey_counts <- 1:15
+bootstrap_samples <- 10000
+p <- avg_detection  # Use model-averaged detection
+
+# Use model-averaged detection probabilities
+p <- avg_detection  # Make sure `avg_detection` is defined in your environment
+
+# Data frame to store results
+pstar_data <- data.frame(
+  surveys = integer(),
+  pstar = double(),
+  lower = double(),
+  upper = double()
+)
+
+# Loop through each number of surveys to calculate P* and confidence intervals
+for (n in survey_counts) {
+  # Bootstrap sampling to compute P* and its confidence intervals
+  pstar_boot <- replicate(bootstrap_samples, {
+    p_boot <- sample(p, length(p), replace = TRUE)  # Resample with replacement
+    mean(1 - (1 - p_boot)^n)  # Compute probability to detect at least one specimen
+  })
+  
+  # Calculate mean and 95% confidence intervals for P*
+  pstar_mean <- mean(pstar_boot)
+  pstar_lower <- quantile(pstar_boot, 0.025)  # 2.5th percentile for lower bound
+  pstar_upper <- quantile(pstar_boot, 0.975)  # 97.5th percentile for upper bound
+  
+  # Store results in the data frame
+  pstar_data <- rbind(
+    pstar_data,
+    data.frame(surveys = n, pstar = pstar_mean, lower = pstar_lower, upper = pstar_upper)
+  )
+}
+
+# Plot the Probability to Detect at Least One Specimen (P*)
+ggplot(pstar_data, aes(x = factor(surveys), y = pstar)) +
+  geom_point(color = "black", size = 4) +  # Black points for P*
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, color = "grey") +  # Grey error bars
+  geom_smooth(aes(group = 1), method = "loess", color = "grey", linetype = "dashed", size = 0.7, se = FALSE) +  # Add a trend line
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +  # Dashed line at y = 1
+  labs(
+    x = "Surveys",
+    y = "p*"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 14, hjust = 0.5, vjust = -1.5),  # x-axis label: size and position
+    axis.title.y = element_text(size = 14, hjust = 0.5, vjust = 1.5),  # y-axis label: size and position
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12),  # Keep x-axis labels straight
+    axis.text.y = element_text(size = 12),
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    axis.line = element_line(color = "black"),  # Add black lines for x and y axes
+    panel.border = element_rect(color = "black", fill = NA, size = 1) # Add a black border around the plot
+  )
+
+
+# Analyze how detection probabilities affect the probability of detection
+set.seed(123)
+survey_counts <- 1:15
+bootstrap_samples <- 10000
+detection_probs <- seq(0.2, 0.8, by = 0.2)
+
+# Data frame to store sensitivity analysis results
+sensitivity_results <- data.frame()
+
+for (p in detection_probs) {
+  for (n in survey_counts) {
+    # Perform bootstrap sampling
+    pstar_boot <- replicate(bootstrap_samples, {
+      p_sample <- rnorm(length(p), mean = p, sd = 0.01)
+      p_sample <- pmin(pmax(p_sample, 0), 1)
+      mean(1 - (1 - p_sample)^n)
+    })
+    
+    # Calculate mean and confidence intervals
+    pstar_mean <- mean(pstar_boot)
+    pstar_lower <- quantile(pstar_boot, 0.025)
+    pstar_upper <- quantile(pstar_boot, 0.975)
+    
+    # Store results
+    sensitivity_results <- rbind(
+      sensitivity_results,
+      data.frame(
+        surveys = n,
+        pstar = pstar_mean,
+        lower = pstar_lower,
+        upper = pstar_upper,
+        detection_prob = p
+      )
+    )
+  }
+}
+
+# Plot Sensitivity Analysis Results ---------------------------------------
+ggplot(sensitivity_results, aes(x = factor(surveys), y = pstar, group = factor(detection_prob))) +
+  geom_point(aes(shape = factor(detection_prob)), size = 3.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, size = 0.7) +
+  geom_line(aes(linetype = factor(detection_prob)), size = 0.7) +
+  scale_shape_manual(values = c(16, 17, 18, 19, 15)) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash", "twodash")) +
+  scale_color_grey(start = 0.2, end = 0.8) +
+  scale_y_continuous(breaks = seq(0, 1.2, by = 0.2), limits = c(0, 1.1), expand = c(0, 0)) +
+  labs(
+    x = "Surveys",
+    y = "p*",
+    shape = "Detection Prob",
+    linetype = "Detection Prob"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 14, hjust = 0.5, vjust = -1.5),
+    axis.title.y = element_text(size = 14, hjust = 0.5, vjust = 1.5),
+    axis.text.x = element_text(angle = 0, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    legend.position = "bottom",
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  coord_cartesian(ylim = c(0, 1.1))
